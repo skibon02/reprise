@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::iter::once;
 use std::ops::Range;
 
 #[derive(Clone, Debug)]
@@ -30,5 +31,9 @@ impl MulticastDiscoveryConfig {
     pub fn with_backup_ports(mut self, backup_ports: Range<u16>) -> Self {
         self.multicast_backup_ports = backup_ports.collect();
         self
+    }
+    
+    pub fn iter_ports(&self) -> impl Iterator<Item = u16> + '_ {
+        once(self.multicast_port).chain(self.multicast_backup_ports.iter().copied())
     }
 }

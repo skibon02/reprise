@@ -12,8 +12,11 @@ rcgen = "0.13.2"
 log = "0.4.27"
 multicast-socket = "0.3.3"
 sha2 = "0.10.9"
-strum = { version = "0.27.1", features = ["derive"] }
 if-addrs = "0.13.4"
+rand = "0.9.1"
 
 [dev-dependencies]
 simple_logger = "5.0.0"
+
+[patch.crates-io]
+multicast-socket = {git = "https://github.com/skibon02/multicast-socket.git"}

@@ -1,47 +1,74 @@
 use std::collections::BTreeMap;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
+use anyhow::bail;
 use if_addrs::get_if_addrs;
-use log::{info, warn};
+use log::{info, trace, warn};
 use multicast_socket::{all_ipv4_interfaces, Interface, Message, MulticastOptions, MulticastSocket};
 use sha2::Digest;
 use tokio::time::Instant;
 use crate::config::MulticastDiscoveryConfig;
 
-const SEND_DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
+const SEND_DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
+const SEND_DISCOVERY_INTERVAL_BACKUP: Duration = Duration::from_secs(10);
 
 pub struct MulticastDiscoverySocket {
     socket: MulticastSocket,
     local_port: u16,
     cfg: MulticastDiscoveryConfig,
     multicast_own_port: u16,
+    random_time_offset: Duration,
 
-    // state machine
-    send_discovery_tm: BTreeMap<Ipv4Addr, Instant>
+    send_discovery_tm: Option<Instant>,
+    send_discovery_other_ports_tm: Option<Instant>,
 }
 
 impl MulticastDiscoverySocket {
     pub fn new(cfg: &MulticastDiscoveryConfig, local_port: u16) -> anyhow::Result<Self> {
-        let options = MulticastOptions {
-            read_timeout: Some(Duration::from_millis(10)),
-            ..Default::default()
-        };
+        let mut is_primary = true;
+        // Try primary and backup ports
+        for port in cfg.iter_ports() {
+            let options = MulticastOptions {
+                read_timeout: Some(Duration::from_millis(10)),
+                reuse_addr: false,
+                ..Default::default()
+            };
 
-        let multicast_own_port = cfg.multicast_port;
-        let socket = MulticastSocket::with_options(
-            SocketAddrV4::new(cfg.multicast_group_ip, multicast_own_port),
-            all_ipv4_interfaces()?,
-            options
-        )?;
+            match MulticastSocket::with_options(
+                SocketAddrV4::new(cfg.multicast_group_ip, port),
+                all_ipv4_interfaces()?,
+                options
+            ) {
+                Ok(socket) => {
+                    if !is_primary {
+                        warn!("Using backup multicast port {} for discovery", port);
+                    }
+                    else {
+                        info!("Using primary multicast port {} for discovery", port);
+                    }
+                    return Ok(Self {
+                        socket,
+                        local_port,
+                        cfg: cfg.clone(),
+                        multicast_own_port: port,
+                        random_time_offset: Duration::from_millis(rand::random_range(200..=700)),
 
-        Ok(Self {
-            socket,
-            local_port,
-            cfg: cfg.clone(),
-            multicast_own_port,
+                        send_discovery_tm: None,
+                        send_discovery_other_ports_tm: None,
+                    })
+                }
+                Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+                    is_primary = false;
+                    continue
+                },
+                Err(e) => {
+                    bail!("Failed to create multicast socket on port {}: {}", port, e);
+                }
+            }
+        }
 
-            send_discovery_tm: BTreeMap::new(),
-        })
+        bail!("Failed to create multicast socket on any of the configured ports: {:?}", cfg);
     }
 
 
@@ -49,30 +76,53 @@ impl MulticastDiscoverySocket {
         self.try_poll().unwrap_or(PollResult::Nothing)
     }
     fn try_poll(&mut self) -> Option<PollResult> {
-        // 1. Send discovery messages if needed
-        for interface in all_interfaces() {
-            if let Some(tm) = self.send_discovery_tm.get(&interface) {
-                if Instant::now() < *tm + SEND_DISCOVERY_INTERVAL {
-                    continue; // skip if not time yet
+        // 1. Announce on current multicast port
+        if self.send_discovery_tm.is_none_or(|tm| Instant::now() > tm + SEND_DISCOVERY_INTERVAL) {
+            self.send_discovery_tm = Some(Instant::now());
+            
+            let msg = DiscoveryMessage::Announce {local_port: self.local_port}.gen_message();
+            for interface in all_interfaces() {
+                // send discovery message to own port
+                if let Err(e) = self.socket.send(&msg, &Interface::Ip(interface)) {
+                    warn!("Failed to send discovery message on interface {}: {}", interface, e);
+                } else {
+                    trace!("Sent discovery message on interface {}", interface);
                 }
             }
+        }
+        
+        // 2. Announce on other multicast ports
+        if self.send_discovery_other_ports_tm.is_none_or(|tm| Instant::now() > tm + SEND_DISCOVERY_INTERVAL_BACKUP) {
+            self.send_discovery_other_ports_tm = Some(Instant::now());
 
-            // send discovery message
-            let msg = DiscoveryMessage::Discovery.gen_message();
-            if let Err(e) = self.socket.send(&msg, &Interface::Ip(interface)) {
-                warn!("Failed to send discovery message to interface {}: {}", interface, e);
-            } else {
-                info!("Sent discovery message to interface {}", interface);
-                self.send_discovery_tm.insert(interface, Instant::now());
+            let msg = DiscoveryMessage::Announce {local_port: self.local_port}.gen_message();
+            for port in self.cfg.iter_ports() {
+                if port == self.multicast_own_port {
+                    continue; // skip own port
+                }
+                
+                for interface in all_interfaces() {
+                    // send discovery message to own port
+                    if let Err(e) = self.socket.send_to_port(&msg, &Interface::Ip(interface), port) {
+                        warn!("Failed to send discovery message on interface {}: {}", interface, e);
+                    } else {
+                        trace!("Sent discovery message on interface {}", interface);
+                    }
+                }
             }
         }
 
-        // 2. Handle incoming messages
+        // 3. Handle incoming messages
         if let Ok(Message {
                 data,
                 origin_address,
                 interface
              }) = self.socket.receive() {
+
+            // Shut up messages from ourselves on all interfaces
+            if all_interfaces().contains(&origin_address.ip()) && origin_address.port() == self.multicast_own_port  {
+                return None;
+            }
 
             let interface_ip = match interface {
                 Interface::Ip(ip) => Some(ip),
@@ -82,31 +132,13 @@ impl MulticastDiscoverySocket {
                 _ => None
             };
 
-            // Our own address, ignoring
-            if all_interfaces().contains(&origin_address.ip()) && origin_address.port() == self.multicast_own_port  {
-                return None;
-            }
-            
             match DiscoveryMessage::try_parse(&data) {
                 Some(DiscoveryMessage::Discovery) => {
-                    info!("Received discovery message from {}", origin_address);
-                    // Respond with a hello message
-                    let hello_msg = DiscoveryMessage::DiscoverHello { local_port: self.local_port }.gen_message();
-                    if let Err(e) = self.socket.send(&hello_msg, &interface) {
-                        warn!("Failed to send hello message to {}: {}", origin_address, e);
-                    } else {
-                        info!("Sent hello message to {}", origin_address);
-                    }
-
-                    // prolong the discovery timer for this interface
-                    if let Some(ip) = interface_ip {
-                        info!("\tUpdating interface {}", ip);
-                        self.send_discovery_tm.insert(ip, Instant::now() + Duration::from_millis(500));
-                    }
+                    // info!("Received discovery message from {}", origin_address);
 
                     None
                 }
-                Some(DiscoveryMessage::DiscoverHello { local_port }) => {
+                Some(DiscoveryMessage::Announce { local_port }) => {
                     
                     Some(PollResult::DiscoveredClient {
                         addr: origin_address
@@ -143,7 +175,7 @@ fn all_interfaces() -> Vec<Ipv4Addr> {
 #[derive(Copy, Clone)]
 pub enum DiscoveryMessage {
     Discovery,
-    DiscoverHello {
+    Announce {
         local_port: u16,
     }
 }
@@ -152,7 +184,7 @@ impl DiscoveryMessage {
     fn header(&self) -> &'static [u8] {
         match self {
             DiscoveryMessage::Discovery => b"discovery",
-            DiscoveryMessage::DiscoverHello { .. } => b"discovery-hello",
+            DiscoveryMessage::Announce { .. } => b"announce",
         }
     }
     fn try_parse(msg: &[u8]) -> Option<Self> {
@@ -160,12 +192,12 @@ impl DiscoveryMessage {
             && msg.len() == DiscoveryMessage::Discovery.header().len() + 32
             && msg.ends_with(sha2::Sha256::digest(&msg[..msg.len() - 32]).as_ref()) {
             Some(DiscoveryMessage::Discovery)
-        } else if msg.starts_with(DiscoveryMessage::DiscoverHello { local_port: 0 }.header())
-            && msg.len() == (DiscoveryMessage::DiscoverHello { local_port: 0 }).header().len() + 2 + 32 {
+        } else if msg.starts_with(DiscoveryMessage::Announce { local_port: 0 }.header())
+            && msg.len() == (DiscoveryMessage::Announce { local_port: 0 }).header().len() + 2 + 32 {
             let local_port = u16::from_be_bytes([msg[msg.len() - 34], msg[msg.len() - 33]]);
             let sha = sha2::Sha256::digest(&msg[..msg.len() - 32]);
             if msg.ends_with(&sha[..32]) {
-                Some(DiscoveryMessage::DiscoverHello { local_port })
+                Some(DiscoveryMessage::Announce { local_port })
             } else {
                 None
             }
@@ -177,7 +209,7 @@ impl DiscoveryMessage {
         let header = self.header();
         let mut message = match self {
             DiscoveryMessage::Discovery => header.to_vec(),
-            DiscoveryMessage::DiscoverHello { local_port } => {
+            DiscoveryMessage::Announce { local_port } => {
                 let mut hello_msg = header.to_vec();
                 hello_msg.extend_from_slice(local_port.to_be_bytes().as_ref());
                 hello_msg

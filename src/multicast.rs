@@ -14,6 +14,7 @@ pub struct MulticastDiscoverySocket {
     socket: MulticastSocket,
     local_port: u16,
     cfg: MulticastDiscoveryConfig,
+    multicast_own_port: u16,
 
     // state machine
     send_discovery_tm: BTreeMap<Ipv4Addr, Instant>
@@ -26,8 +27,9 @@ impl MulticastDiscoverySocket {
             ..Default::default()
         };
 
+        let multicast_own_port = cfg.multicast_port;
         let socket = MulticastSocket::with_options(
-            SocketAddrV4::new(cfg.multicast_group_ip, cfg.multicast_port),
+            SocketAddrV4::new(cfg.multicast_group_ip, multicast_own_port),
             all_ipv4_interfaces()?,
             options
         )?;
@@ -36,6 +38,7 @@ impl MulticastDiscoverySocket {
             socket,
             local_port,
             cfg: cfg.clone(),
+            multicast_own_port,
 
             send_discovery_tm: BTreeMap::new(),
         })
@@ -92,14 +95,17 @@ impl MulticastDiscoverySocket {
 
                     // prolong the discovery timer for this interface
                     if let Some(ip) = interface_ip {
-                        info!("\tIncreasing timeout for {ip}");
-                        self.send_discovery_tm.insert(ip, Instant::now());
+                        self.send_discovery_tm.insert(ip, Instant::now() + Duration::from_millis(500));
                     }
 
                     None
                 }
                 Some(DiscoveryMessage::DiscoverHello { local_port }) => {
-                    info!("Received hello message from {}: local port {}", origin_address, local_port);
+                    // Our own address, ignoring
+                    if all_interfaces().contains(&origin_address.ip()) && origin_address.port() == self.multicast_own_port  {
+                        return None;
+                    }
+                    
                     Some(PollResult::DiscoveredClient {
                         addr: origin_address
                     })

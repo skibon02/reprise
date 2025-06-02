@@ -35,7 +35,7 @@ impl Reprise {
                     PollResult::DiscoveredClient {
                         addr
                     } => {
-                        info!("Multicast discovery: Discovered client at {addr}");
+                        info!("\t\tMulticast discovery: Discovered client at {addr}");
                     }
                 }
             }

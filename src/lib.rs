@@ -33,9 +33,10 @@ impl Reprise {
                         yield_now();
                     }
                     PollResult::DiscoveredClient {
-                        addr
+                        addr,
+                        discover_id
                     } => {
-                        info!("\t\tMulticast discovery: Discovered client at {addr}");
+                        info!("\t\tMulticast discovery: Discovered client at {addr} - {:x}", discover_id);
                     }
                 }
             }

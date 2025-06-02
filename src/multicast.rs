@@ -18,7 +18,7 @@ pub struct MulticastDiscoverySocket {
     local_port: u16,
     cfg: MulticastDiscoveryConfig,
     multicast_own_port: u16,
-    random_time_offset: Duration,
+    discover_id: u32,
 
     send_discovery_tm: Option<Instant>,
     send_discovery_other_ports_tm: Option<Instant>,
@@ -52,7 +52,7 @@ impl MulticastDiscoverySocket {
                         local_port,
                         cfg: cfg.clone(),
                         multicast_own_port: port,
-                        random_time_offset: Duration::from_millis(rand::random_range(200..=700)),
+                        discover_id: rand::random_range(0..u32::MAX),
 
                         send_discovery_tm: None,
                         send_discovery_other_ports_tm: None,
@@ -80,7 +80,7 @@ impl MulticastDiscoverySocket {
         if self.send_discovery_tm.is_none_or(|tm| Instant::now() > tm + SEND_DISCOVERY_INTERVAL) {
             self.send_discovery_tm = Some(Instant::now());
             
-            let msg = DiscoveryMessage::Announce {local_port: self.local_port}.gen_message();
+            let msg = DiscoveryMessage::Announce {local_port: self.local_port, discover_id: self.discover_id}.gen_message();
             for interface in all_interfaces() {
                 // send discovery message to own port
                 if let Err(e) = self.socket.send(&msg, &Interface::Ip(interface)) {
@@ -95,7 +95,7 @@ impl MulticastDiscoverySocket {
         if self.send_discovery_other_ports_tm.is_none_or(|tm| Instant::now() > tm + SEND_DISCOVERY_INTERVAL_BACKUP) {
             self.send_discovery_other_ports_tm = Some(Instant::now());
 
-            let msg = DiscoveryMessage::Announce {local_port: self.local_port}.gen_message();
+            let msg = DiscoveryMessage::Announce {local_port: self.local_port, discover_id: self.discover_id}.gen_message();
             for port in self.cfg.iter_ports() {
                 if port == self.multicast_own_port {
                     continue; // skip own port
@@ -124,24 +124,28 @@ impl MulticastDiscoverySocket {
                 return None;
             }
 
-            let interface_ip = match interface {
-                Interface::Ip(ip) => Some(ip),
-                Interface::Index(i) => {
-                    get_ip_from_ifindex(i)
-                }
-                _ => None
-            };
 
             match DiscoveryMessage::try_parse(&data) {
                 Some(DiscoveryMessage::Discovery) => {
                     // info!("Received discovery message from {}", origin_address);
+                    // let interface_ip = match interface {
+                    //     Interface::Ip(ip) => Some(ip),
+                    //     Interface::Index(i) => {
+                    //         get_ip_from_ifindex(i)
+                    //     }
+                    //     _ => None
+                    // };
 
                     None
                 }
-                Some(DiscoveryMessage::Announce { local_port }) => {
+                Some(DiscoveryMessage::Announce { local_port, discover_id }) => {
                     
                     Some(PollResult::DiscoveredClient {
-                        addr: origin_address
+                        addr: SocketAddrV4::new(
+                            *origin_address.ip(),
+                            local_port,
+                        ),
+                        discover_id,
                     })
                 }
                 None => {
@@ -177,6 +181,7 @@ pub enum DiscoveryMessage {
     Discovery,
     Announce {
         local_port: u16,
+        discover_id: u32,
     }
 }
 
@@ -192,12 +197,16 @@ impl DiscoveryMessage {
             && msg.len() == DiscoveryMessage::Discovery.header().len() + 32
             && msg.ends_with(sha2::Sha256::digest(&msg[..msg.len() - 32]).as_ref()) {
             Some(DiscoveryMessage::Discovery)
-        } else if msg.starts_with(DiscoveryMessage::Announce { local_port: 0 }.header())
-            && msg.len() == (DiscoveryMessage::Announce { local_port: 0 }).header().len() + 2 + 32 {
-            let local_port = u16::from_be_bytes([msg[msg.len() - 34], msg[msg.len() - 33]]);
+        } else if msg.starts_with(DiscoveryMessage::Announce { local_port: 0, discover_id: 0 }.header())
+            && msg.len() == (DiscoveryMessage::Announce { local_port: 0, discover_id: 0 }).header().len() + 2 + 4 + 32 {
+            let local_port = u16::from_be_bytes([msg[msg.len() - 38], msg[msg.len() - 37]]);
+            let discover_id = u32::from_be_bytes([
+                msg[msg.len() - 36], msg[msg.len() - 35],
+                msg[msg.len() - 34], msg[msg.len() - 33]
+            ]);
             let sha = sha2::Sha256::digest(&msg[..msg.len() - 32]);
             if msg.ends_with(&sha[..32]) {
-                Some(DiscoveryMessage::Announce { local_port })
+                Some(DiscoveryMessage::Announce { local_port, discover_id })
             } else {
                 None
             }
@@ -209,9 +218,10 @@ impl DiscoveryMessage {
         let header = self.header();
         let mut message = match self {
             DiscoveryMessage::Discovery => header.to_vec(),
-            DiscoveryMessage::Announce { local_port } => {
+            DiscoveryMessage::Announce { local_port, discover_id } => {
                 let mut hello_msg = header.to_vec();
                 hello_msg.extend_from_slice(local_port.to_be_bytes().as_ref());
+                hello_msg.extend_from_slice(discover_id.to_be_bytes().as_ref());
                 hello_msg
             }
         };
@@ -227,5 +237,6 @@ pub enum PollResult {
     Nothing,
     DiscoveredClient {
         addr: SocketAddrV4,
-    }
+        discover_id: u32,
+    },
 }

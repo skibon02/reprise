@@ -1,2 +1,2 @@
-- multicast-socket: allow sending packet to specific IP instead of whole multicast group
-- multicast-socket: allow port rebinding OR create multiple multicast sockets for each backup port
+- multicast-socket: dynamically enter multicast group on new interfaces
+- multicast: Add time buffering to collect multiple ips of the same client

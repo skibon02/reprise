@@ -13,6 +13,7 @@ log = "0.4.27"
 multicast-socket = "0.3.3"
 sha2 = "0.10.9"
 strum = { version = "0.27.1", features = ["derive"] }
+if-addrs = "0.13.4"
 
 [dev-dependencies]
 simple_logger = "5.0.0"

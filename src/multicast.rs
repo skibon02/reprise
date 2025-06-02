@@ -1,12 +1,10 @@
 use std::collections::BTreeMap;
-use std::io::Write;
-use std::net::{Ipv4Addr, SocketAddrV4};
-use std::ops::Deref;
+use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
+use if_addrs::get_if_addrs;
 use log::{info, warn};
 use multicast_socket::{all_ipv4_interfaces, Interface, Message, MulticastOptions, MulticastSocket};
 use sha2::Digest;
-use strum::Display;
 use tokio::time::Instant;
 use crate::config::MulticastDiscoveryConfig;
 
@@ -55,7 +53,7 @@ impl MulticastDiscoverySocket {
                     continue; // skip if not time yet
                 }
             }
-            
+
             // send discovery message
             let msg = DiscoveryMessage::Discovery.gen_message();
             if let Err(e) = self.socket.send(&msg, &Interface::Ip(interface)) {
@@ -73,35 +71,41 @@ impl MulticastDiscoverySocket {
                 interface
              }) = self.socket.receive() {
 
-            let Interface::Ip(interface) = interface else {
-                warn!("Received message from non-IP interface: {:?}", interface);
-                return None;
+            let interface_ip = match interface {
+                Interface::Ip(ip) => Some(ip),
+                Interface::Index(i) => {
+                    get_ip_from_ifindex(i)
+                }
+                _ => None
             };
-            
+
             match DiscoveryMessage::try_parse(&data) {
                 Some(DiscoveryMessage::Discovery) => {
-                    info!("Received discovery message from {} on interface {}", origin_address, interface);
+                    info!("Received discovery message from {}", origin_address);
                     // Respond with a hello message
                     let hello_msg = DiscoveryMessage::DiscoverHello { local_port: self.local_port }.gen_message();
-                    if let Err(e) = self.socket.send(&hello_msg, &Interface::Ip(interface)) {
-                        warn!("Failed to send hello message to {}: {}", interface, e);
+                    if let Err(e) = self.socket.send(&hello_msg, &interface) {
+                        warn!("Failed to send hello message to {}: {}", origin_address, e);
                     } else {
-                        info!("Sent hello message to {}", interface);
+                        info!("Sent hello message to {}", origin_address);
                     }
-                    
+
                     // prolong the discovery timer for this interface
-                    self.send_discovery_tm.insert(interface, Instant::now());
-                    
+                    if let Some(ip) = interface_ip {
+                        info!("\tIncreasing timeout for {ip}");
+                        self.send_discovery_tm.insert(ip, Instant::now());
+                    }
+
                     None
                 }
                 Some(DiscoveryMessage::DiscoverHello { local_port }) => {
-                    info!("Received hello message from {} on interface {}: local port {}", origin_address, interface, local_port);
+                    info!("Received hello message from {}: local port {}", origin_address, local_port);
                     Some(PollResult::DiscoveredClient {
                         addr: origin_address
                     })
                 }
                 None => {
-                    warn!("Received unknown message from {} on interface {}: {:?}", origin_address, interface, data);
+                    warn!("Received unknown message from {}: {:?}", origin_address, data);
                     None
                 }
             }
@@ -110,6 +114,19 @@ impl MulticastDiscoverySocket {
             None
         }
     }
+}
+fn get_ip_from_ifindex(ifindex: i32) -> Option<Ipv4Addr> {
+    // Iterate through all interfaces
+    for iface in get_if_addrs().ok()? {
+        if iface.index == Some(ifindex as u32) {
+            let IpAddr::V4(ipv4) = iface.ip() else {
+                return None;
+            };
+
+            return Some(ipv4);
+        }
+    }
+    None
 }
 fn all_interfaces() -> Vec<Ipv4Addr> {
     all_ipv4_interfaces().unwrap_or_default()
@@ -131,11 +148,11 @@ impl DiscoveryMessage {
         }
     }
     fn try_parse(msg: &[u8]) -> Option<Self> {
-        if msg.starts_with(DiscoveryMessage::Discovery.header()) 
+        if msg.starts_with(DiscoveryMessage::Discovery.header())
             && msg.len() == DiscoveryMessage::Discovery.header().len() + 32
             && msg.ends_with(sha2::Sha256::digest(&msg[..msg.len() - 32]).as_ref()) {
             Some(DiscoveryMessage::Discovery)
-        } else if msg.starts_with(DiscoveryMessage::DiscoverHello { local_port: 0 }.header()) 
+        } else if msg.starts_with(DiscoveryMessage::DiscoverHello { local_port: 0 }.header())
             && msg.len() == (DiscoveryMessage::DiscoverHello { local_port: 0 }).header().len() + 2 + 32 {
             let local_port = u16::from_be_bytes([msg[msg.len() - 34], msg[msg.len() - 33]]);
             let sha = sha2::Sha256::digest(&msg[..msg.len() - 32]);
@@ -158,7 +175,7 @@ impl DiscoveryMessage {
                 hello_msg
             }
         };
-        
+
         let sha = sha2::Sha256::digest(&message);
         message.extend_from_slice(&sha[..32]);
         message

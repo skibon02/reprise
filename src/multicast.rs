@@ -52,7 +52,7 @@ impl MulticastDiscoverySocket {
         // 1. Send discovery messages if needed
         for interface in all_interfaces() {
             if let Some(tm) = self.send_discovery_tm.get(&interface) {
-                if tm.elapsed() < SEND_DISCOVERY_INTERVAL {
+                if Instant::now() < *tm + SEND_DISCOVERY_INTERVAL {
                     continue; // skip if not time yet
                 }
             }
@@ -82,6 +82,11 @@ impl MulticastDiscoverySocket {
                 _ => None
             };
 
+            // Our own address, ignoring
+            if all_interfaces().contains(&origin_address.ip()) && origin_address.port() == self.multicast_own_port  {
+                return None;
+            }
+            
             match DiscoveryMessage::try_parse(&data) {
                 Some(DiscoveryMessage::Discovery) => {
                     info!("Received discovery message from {}", origin_address);
@@ -95,16 +100,13 @@ impl MulticastDiscoverySocket {
 
                     // prolong the discovery timer for this interface
                     if let Some(ip) = interface_ip {
+                        info!("\tUpdating interface {}", ip);
                         self.send_discovery_tm.insert(ip, Instant::now() + Duration::from_millis(500));
                     }
 
                     None
                 }
                 Some(DiscoveryMessage::DiscoverHello { local_port }) => {
-                    // Our own address, ignoring
-                    if all_interfaces().contains(&origin_address.ip()) && origin_address.port() == self.multicast_own_port  {
-                        return None;
-                    }
                     
                     Some(PollResult::DiscoveredClient {
                         addr: origin_address

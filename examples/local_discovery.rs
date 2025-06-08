@@ -19,6 +19,6 @@ async fn main() {
     info!("Reprise started with multicast discovery!");
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
-        reprise.discover();
+        // reprise.discover();
     }
 }

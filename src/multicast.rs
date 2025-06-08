@@ -1,17 +1,18 @@
-use std::collections::BTreeMap;
 use std::io;
+use std::iter::once;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 use anyhow::bail;
 use if_addrs::get_if_addrs;
-use log::{info, trace, warn};
+use log::{debug, info, trace, warn};
 use multicast_socket::{all_ipv4_interfaces, Interface, Message, MulticastOptions, MulticastSocket};
 use sha2::Digest;
 use tokio::time::Instant;
 use crate::config::MulticastDiscoveryConfig;
 
-const SEND_DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
-const SEND_DISCOVERY_INTERVAL_BACKUP: Duration = Duration::from_secs(10);
+const BG_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(3);
+const EXTENDED_ANNOUNCE_REQUEST_INTERVAL: Duration = Duration::from_secs(10);
+const EXTENDED_ANNOUNCE_EFFECT_DUR: Duration = Duration::from_secs(30);
 
 pub struct MulticastDiscoverySocket {
     socket: MulticastSocket,
@@ -20,18 +21,25 @@ pub struct MulticastDiscoverySocket {
     multicast_own_port: u16,
     discover_id: u32,
 
+    central_discovery_enabled: bool,
+    announce_enabled: bool,
+    extend_disc_request_tm: Option<Instant>,
     send_discovery_tm: Option<Instant>,
     send_discovery_other_ports_tm: Option<Instant>,
 }
 
 impl MulticastDiscoverySocket {
+    // Create new socket for multicast discovery. Announcements are enabled by default
     pub fn new(cfg: &MulticastDiscoveryConfig, local_port: u16) -> anyhow::Result<Self> {
+        let central_discovery_enabled = cfg.central_discovery_addr.is_some();
         let mut is_primary = true;
         // Try primary and backup ports
-        for port in cfg.iter_ports() {
+        let main_port = cfg.iter_ports().next().unwrap();
+        for port in cfg.iter_ports().chain(once(0)) {
             let options = MulticastOptions {
                 read_timeout: Some(Duration::from_millis(10)),
                 reuse_addr: false,
+               
                 ..Default::default()
             };
 
@@ -41,11 +49,21 @@ impl MulticastDiscoverySocket {
                 options
             ) {
                 Ok(socket) => {
-                    if !is_primary {
-                        warn!("Using backup multicast port {} for discovery", port);
+                    if is_primary {
+                        debug!("Using primary multicast port {} for discovery", port);
+                    }
+                    else if port == 0 {
+                        let failed_ports = cfg.iter_ports().filter(|p| *p != 0);
+                        warn!("Unable to start on the main or backup ports ({:?})!", &failed_ports.collect::<Vec<_>>());
+                        if !central_discovery_enabled {
+                            warn!("You will be unable to discover other clients!");
+                        }
+                        else {
+                            warn!("You will be able to discover clients only when your network is online!");
+                        }
                     }
                     else {
-                        info!("Using primary multicast port {} for discovery", port);
+                        warn!("Using backup multicast port {} for discovery (unable to start on main port {})", port, main_port);
                     }
                     return Ok(Self {
                         socket,
@@ -54,6 +72,9 @@ impl MulticastDiscoverySocket {
                         multicast_own_port: port,
                         discover_id: rand::random_range(0..u32::MAX),
 
+                        central_discovery_enabled,
+                        announce_enabled: cfg.enable_announce,
+                        extend_disc_request_tm: None,
                         send_discovery_tm: None,
                         send_discovery_other_ports_tm: None,
                     })
@@ -71,48 +92,45 @@ impl MulticastDiscoverySocket {
         bail!("Failed to create multicast socket on any of the configured ports: {:?}", cfg);
     }
 
+    /// Setting this to `false` will disable both announcements and handling discovery packets
+    pub fn set_announce_en(&mut self, en: bool) {
+        self.announce_enabled = en;
+    }
 
     pub fn poll(&mut self) -> PollResult {
         self.try_poll().unwrap_or(PollResult::Nothing)
     }
-    fn try_poll(&mut self) -> Option<PollResult> {
-        // 1. Announce on current multicast port
-        if self.send_discovery_tm.is_none_or(|tm| Instant::now() > tm + SEND_DISCOVERY_INTERVAL) {
-            self.send_discovery_tm = Some(Instant::now());
-            
-            let msg = DiscoveryMessage::Announce {local_port: self.local_port, discover_id: self.discover_id}.gen_message();
-            for interface in all_interfaces() {
-                // send discovery message to own port
-                if let Err(e) = self.socket.send(&msg, &Interface::Ip(interface)) {
-                    warn!("Failed to send discovery message on interface {}: {}", interface, e);
-                } else {
-                    trace!("Sent discovery message on interface {}", interface);
-                }
-            }
-        }
-        
-        // 2. Announce on other multicast ports
-        if self.send_discovery_other_ports_tm.is_none_or(|tm| Instant::now() > tm + SEND_DISCOVERY_INTERVAL_BACKUP) {
-            self.send_discovery_other_ports_tm = Some(Instant::now());
+    pub fn try_send_announce_packet(&mut self, disconnected: bool) {
+        if self.announce_enabled {
+            let is_extended_announcement = self.extend_disc_request_tm.is_some_and(|tm| tm.elapsed() < EXTENDED_ANNOUNCE_EFFECT_DUR);
+            if self.send_discovery_tm.is_none_or(|tm| Instant::now() > tm + BG_ANNOUNCE_INTERVAL) {
+                self.send_discovery_tm = Some(Instant::now());
 
-            let msg = DiscoveryMessage::Announce {local_port: self.local_port, discover_id: self.discover_id}.gen_message();
-            for port in self.cfg.iter_ports() {
-                if port == self.multicast_own_port {
-                    continue; // skip own port
-                }
-                
+                let msg = DiscoveryMessage::Announce {local_port: self.local_port, discover_id: self.discover_id, disconnected}.gen_message();
                 for interface in all_interfaces() {
-                    // send discovery message to own port
-                    if let Err(e) = self.socket.send_to_port(&msg, &Interface::Ip(interface), port) {
-                        warn!("Failed to send discovery message on interface {}: {}", interface, e);
-                    } else {
-                        trace!("Sent discovery message on interface {}", interface);
+                    let ports = once(self.cfg.multicast_port);
+                    let ports = if is_extended_announcement {
+                        ports.chain(self.cfg.multicast_backup_ports.iter().copied())
+                    }
+                    else {
+                        ports.chain([].iter().copied())
+                    };
+                    for port in ports {
+                        if let Err(e) = self.socket.send_to_port(&msg, &Interface::Ip(interface), port) {
+                            warn!("Failed to send discovery message on interface {}: {}", interface, e);
+                        } else {
+                            trace!("Sent discovery message to port {} on interface {}", port, interface);
+                        }
                     }
                 }
             }
         }
-
-        // 3. Handle incoming messages
+    }
+    fn try_poll(&mut self) -> Option<PollResult> {
+        // 1. Announce routine
+        self.try_send_announce_packet(false);
+            
+        // 2. Handle incoming messages
         if let Ok(Message {
                 data,
                 origin_address,
@@ -127,26 +145,43 @@ impl MulticastDiscoverySocket {
 
             match DiscoveryMessage::try_parse(&data) {
                 Some(DiscoveryMessage::Discovery) => {
-                    // info!("Received discovery message from {}", origin_address);
-                    // let interface_ip = match interface {
-                    //     Interface::Ip(ip) => Some(ip),
-                    //     Interface::Index(i) => {
-                    //         get_ip_from_ifindex(i)
-                    //     }
-                    //     _ => None
-                    // };
-
+                    if self.announce_enabled {
+                        let announce = DiscoveryMessage::Announce {
+                            disconnected: false,
+                            discover_id: self.discover_id,
+                            local_port: self.local_port,
+                        }.gen_message();
+                        if let Err(e) = self.socket.send_to(&announce, origin_address) {
+                            warn!("Failed to answer to discovery packet: {:?}", e);
+                        }
+                        
+                    }
                     None
                 }
-                Some(DiscoveryMessage::Announce { local_port, discover_id }) => {
+                Some(DiscoveryMessage::Announce { local_port, discover_id, disconnected}) => {
+                    if disconnected {
+                        Some(PollResult::DisconnectedClient {
+                            addr: SocketAddrV4::new(
+                                *origin_address.ip(),
+                                local_port,
+                            ),
+                            discover_id
+                        })
+                    }
+                    else {
+                        Some(PollResult::DiscoveredClient {
+                            addr: SocketAddrV4::new(
+                                *origin_address.ip(),
+                                local_port,
+                            ),
+                            discover_id,
+                        })
+                    }
+                }
+                Some(DiscoveryMessage::ExtendDiscovery) => {
+                    self.extend_disc_request_tm = Some(Instant::now());
                     
-                    Some(PollResult::DiscoveredClient {
-                        addr: SocketAddrV4::new(
-                            *origin_address.ip(),
-                            local_port,
-                        ),
-                        discover_id,
-                    })
+                    None
                 }
                 None => {
                     warn!("Received unknown message from {}: {:?}", origin_address, data);
@@ -157,6 +192,12 @@ impl MulticastDiscoverySocket {
         else {
             None
         }
+    }
+}
+impl Drop for MulticastDiscoverySocket {
+    fn drop(&mut self) {
+        // Announce disconnection
+        self.try_send_announce_packet(true);
     }
 }
 fn get_ip_from_ifindex(ifindex: i32) -> Option<Ipv4Addr> {
@@ -176,29 +217,50 @@ fn all_interfaces() -> Vec<Ipv4Addr> {
     all_ipv4_interfaces().unwrap_or_default()
 }
 
+
+#[derive(Copy, Clone)]
+pub enum DiscoveryMessageType {
+    Discovery,
+    Announce,
+    ExtendDiscovery,
+}
+
+impl DiscoveryMessageType {
+    fn header(&self) -> &'static [u8] {
+        match self {
+            DiscoveryMessageType::Discovery => b"discovery",
+            DiscoveryMessageType::Announce { .. } => b"announce",
+            DiscoveryMessageType::ExtendDiscovery => b"extend-discovery",
+        }
+    }
+}
+
 #[derive(Copy, Clone)]
 pub enum DiscoveryMessage {
     Discovery,
     Announce {
         local_port: u16,
         discover_id: u32,
-    }
+        disconnected: bool,
+    },
+    ExtendDiscovery,
 }
 
 impl DiscoveryMessage {
-    fn header(&self) -> &'static [u8] {
+    fn msg_type(&self) -> DiscoveryMessageType {
         match self {
-            DiscoveryMessage::Discovery => b"discovery",
-            DiscoveryMessage::Announce { .. } => b"announce",
+            DiscoveryMessage::Discovery => DiscoveryMessageType::Discovery,
+            DiscoveryMessage::Announce { .. } => DiscoveryMessageType::Announce,
+            DiscoveryMessage::ExtendDiscovery => DiscoveryMessageType::ExtendDiscovery,
         }
     }
     fn try_parse(msg: &[u8]) -> Option<Self> {
-        if msg.starts_with(DiscoveryMessage::Discovery.header())
-            && msg.len() == DiscoveryMessage::Discovery.header().len() + 32
+        if msg.starts_with(DiscoveryMessageType::Discovery.header())
+            && msg.len() == DiscoveryMessageType::Discovery.header().len() + 32
             && msg.ends_with(sha2::Sha256::digest(&msg[..msg.len() - 32]).as_ref()) {
             Some(DiscoveryMessage::Discovery)
-        } else if msg.starts_with(DiscoveryMessage::Announce { local_port: 0, discover_id: 0 }.header())
-            && msg.len() == (DiscoveryMessage::Announce { local_port: 0, discover_id: 0 }).header().len() + 2 + 4 + 32 {
+        } else if msg.starts_with(DiscoveryMessageType::Announce.header())
+            && msg.len() == DiscoveryMessageType::Announce.header().len() + 2 + 4 + 32 {
             let local_port = u16::from_be_bytes([msg[msg.len() - 38], msg[msg.len() - 37]]);
             let discover_id = u32::from_be_bytes([
                 msg[msg.len() - 36], msg[msg.len() - 35],
@@ -206,7 +268,7 @@ impl DiscoveryMessage {
             ]);
             let sha = sha2::Sha256::digest(&msg[..msg.len() - 32]);
             if msg.ends_with(&sha[..32]) {
-                Some(DiscoveryMessage::Announce { local_port, discover_id })
+                Some(DiscoveryMessage::Announce { local_port, discover_id, disconnected: false })
             } else {
                 None
             }
@@ -215,15 +277,17 @@ impl DiscoveryMessage {
         }
     }
     fn gen_message(&self) -> Vec<u8> {
-        let header = self.header();
+        let header = self.msg_type().header();
         let mut message = match self {
             DiscoveryMessage::Discovery => header.to_vec(),
-            DiscoveryMessage::Announce { local_port, discover_id } => {
+            DiscoveryMessage::Announce { local_port, discover_id, disconnected } => {
                 let mut hello_msg = header.to_vec();
                 hello_msg.extend_from_slice(local_port.to_be_bytes().as_ref());
                 hello_msg.extend_from_slice(discover_id.to_be_bytes().as_ref());
+                hello_msg.push(*disconnected as u8);
                 hello_msg
             }
+            DiscoveryMessage::ExtendDiscovery => header.to_vec(),
         };
 
         let sha = sha2::Sha256::digest(&message);
@@ -239,4 +303,8 @@ pub enum PollResult {
         addr: SocketAddrV4,
         discover_id: u32,
     },
+    DisconnectedClient {
+        addr: SocketAddrV4,
+        discover_id: u32
+    }
 }

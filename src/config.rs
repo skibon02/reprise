@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::iter::once;
+use std::net::IpAddr;
 use std::ops::Range;
 
 #[derive(Clone, Debug)]
@@ -8,6 +9,9 @@ pub struct MulticastDiscoveryConfig {
     pub multicast_port: u16,
     pub multicast_backup_ports: Vec<u16>,
     pub service_name: Cow<'static, str>,
+    pub central_discovery_addr: Option<IpAddr>,
+    
+    pub enable_announce: bool
 }
 
 impl MulticastDiscoveryConfig {
@@ -18,8 +22,10 @@ impl MulticastDiscoveryConfig {
         Self {
             multicast_group_ip,
             multicast_port: 37337,
-            multicast_backup_ports: (61337..61347).collect(),
+            multicast_backup_ports: (61345..61347).collect(),
             service_name: Cow::Borrowed(service_name),
+            central_discovery_addr: None,
+            enable_announce: true,
         }
     }
     
@@ -35,5 +41,10 @@ impl MulticastDiscoveryConfig {
     
     pub fn iter_ports(&self) -> impl Iterator<Item = u16> + '_ {
         once(self.multicast_port).chain(self.multicast_backup_ports.iter().copied())
+    }
+    
+    pub fn with_disabled_announce(mut self) -> Self {
+        self.enable_announce = false;
+        self
     }
 }

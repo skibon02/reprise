@@ -1,3 +1,4 @@
+use std::ops::Deref;
 use std::io;
 use std::iter::once;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
@@ -11,21 +12,39 @@ use tokio::time::Instant;
 use crate::config::MulticastDiscoveryConfig;
 
 const BG_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(3);
-const EXTENDED_ANNOUNCE_REQUEST_INTERVAL: Duration = Duration::from_secs(10);
-const EXTENDED_ANNOUNCE_EFFECT_DUR: Duration = Duration::from_secs(30);
+const EXTENDED_ANNOUNCE_REQUEST_INTERVAL: Duration = Duration::from_secs(20);
+const EXTENDED_ANNOUNCE_EFFECT_DUR: Duration = Duration::from_secs(45);
 
 pub struct MulticastDiscoverySocket {
     socket: MulticastSocket,
     local_port: u16,
     cfg: MulticastDiscoveryConfig,
-    multicast_own_port: u16,
     discover_id: u32,
+    running_port: MulticastRunningPort,
 
     central_discovery_enabled: bool,
     announce_enabled: bool,
     extend_disc_request_tm: Option<Instant>,
     send_discovery_tm: Option<Instant>,
-    send_discovery_other_ports_tm: Option<Instant>,
+    send_extend_request_tm: Option<Instant>,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum MulticastRunningPort {
+    Primary(u16),
+    Backup(u16),
+    Other
+}
+
+impl Deref for MulticastRunningPort {
+    type Target = u16;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            MulticastRunningPort::Primary(p) => p,
+            MulticastRunningPort::Backup(p) => p,
+            MulticastRunningPort::Other => &0,
+        }
+    }
 }
 
 impl MulticastDiscoverySocket {
@@ -49,8 +68,9 @@ impl MulticastDiscoverySocket {
                 options
             ) {
                 Ok(socket) => {
-                    if is_primary {
+                    let running_port = if is_primary {
                         debug!("Using primary multicast port {} for discovery", port);
+                        MulticastRunningPort::Primary(port)
                     }
                     else if port == 0 {
                         let failed_ports = cfg.iter_ports().filter(|p| *p != 0);
@@ -61,22 +81,24 @@ impl MulticastDiscoverySocket {
                         else {
                             warn!("You will be able to discover clients only when your network is online!");
                         }
+                        MulticastRunningPort::Other
                     }
                     else {
                         warn!("Using backup multicast port {} for discovery (unable to start on main port {})", port, main_port);
-                    }
+                        MulticastRunningPort::Backup(port)
+                    };
                     return Ok(Self {
                         socket,
                         local_port,
                         cfg: cfg.clone(),
-                        multicast_own_port: port,
                         discover_id: rand::random_range(0..u32::MAX),
+                        running_port,
 
                         central_discovery_enabled,
                         announce_enabled: cfg.enable_announce,
                         extend_disc_request_tm: None,
                         send_discovery_tm: None,
-                        send_discovery_other_ports_tm: None,
+                        send_extend_request_tm: None,
                     })
                 }
                 Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
@@ -94,6 +116,9 @@ impl MulticastDiscoverySocket {
     
     pub fn discover_id(&self) -> u32 {
         self.discover_id
+    }
+    pub fn running_port(&self) -> MulticastRunningPort {
+        self.running_port
     }
 
     /// Setting this to `false` will disable both announcements and handling discovery packets
@@ -150,6 +175,27 @@ impl MulticastDiscoverySocket {
     fn try_poll(&mut self) -> Option<PollResult> {
         // 1. Announce routine
         self.try_send_announce_packet(false);
+        
+        // 2. Extend request routine
+        if matches!(self.running_port, MulticastRunningPort::Backup(_)) {
+            if self.send_extend_request_tm.is_none_or(|tm| Instant::now() > tm + EXTENDED_ANNOUNCE_REQUEST_INTERVAL) {
+                self.send_extend_request_tm = Some(Instant::now());
+
+                let msg = DiscoveryMessage::ExtendAnnouncements.gen_message();
+                for interface in all_interfaces() {
+                    let ports = once(self.cfg.multicast_port);
+                    let ports = ports.chain(self.cfg.multicast_backup_ports.iter().copied());
+                    for port in ports {
+                        if let Err(e) = self.socket.send_to_port(&msg, &Interface::Ip(interface), port) {
+                            warn!("Failed to send ExtendAnnouncement message on interface {}: {}", interface, e);
+                        } else {
+                            trace!("Sent discovery message to port {} on interface {}", port, interface);
+                        }
+                    }
+                }
+            }
+            
+        }
             
         // 2. Handle incoming messages
         if let Ok(Message {
@@ -159,10 +205,9 @@ impl MulticastDiscoverySocket {
              }) = self.socket.receive() {
 
             // Shut up messages from ourselves on all interfaces
-            if all_interfaces().contains(&origin_address.ip()) && origin_address.port() == self.multicast_own_port  {
+            if all_interfaces().contains(&origin_address.ip()) && origin_address.port() == *self.running_port  {
                 return None;
             }
-
 
             match DiscoveryMessage::try_parse(&data) {
                 Some(DiscoveryMessage::Discovery) => {
@@ -199,7 +244,7 @@ impl MulticastDiscoverySocket {
                         })
                     }
                 }
-                Some(DiscoveryMessage::ExtendDiscovery) => {
+                Some(DiscoveryMessage::ExtendAnnouncements) => {
                     self.extend_disc_request_tm = Some(Instant::now());
                     
                     None
@@ -239,50 +284,54 @@ fn all_interfaces() -> Vec<Ipv4Addr> {
 }
 
 
+/// Message kind for `DiscoveryMessage` type
 #[derive(Copy, Clone)]
-pub enum DiscoveryMessageType {
+pub enum DiscoveryMessageKind {
     Discovery,
     Announce,
-    ExtendDiscovery,
+    ExtendAnnouncements,
 }
 
-impl DiscoveryMessageType {
+impl DiscoveryMessageKind {
     fn header(&self) -> &'static [u8] {
         match self {
-            DiscoveryMessageType::Discovery => b"discovery",
-            DiscoveryMessageType::Announce { .. } => b"announce",
-            DiscoveryMessageType::ExtendDiscovery => b"extend-discovery",
+            DiscoveryMessageKind::Discovery => b"discovery",
+            DiscoveryMessageKind::Announce { .. } => b"announce",
+            DiscoveryMessageKind::ExtendAnnouncements => b"extend-announcements",
         }
     }
 }
 
 #[derive(Copy, Clone)]
 pub enum DiscoveryMessage {
+    /// Ping packet used to trigger other endpoints to send Announce packet back
     Discovery,
+    /// Tell other endpoints that we are running and available for making connection
     Announce {
         local_port: u16,
         discover_id: u32,
         disconnected: bool,
     },
-    ExtendDiscovery,
+    /// Request for endpoints on Primary and Backup ports to extend their announcements scope to Backup ports as well
+    ExtendAnnouncements,
 }
 
 impl DiscoveryMessage {
-    fn msg_type(&self) -> DiscoveryMessageType {
+    fn msg_type(&self) -> DiscoveryMessageKind {
         match self {
-            DiscoveryMessage::Discovery => DiscoveryMessageType::Discovery,
-            DiscoveryMessage::Announce { .. } => DiscoveryMessageType::Announce,
-            DiscoveryMessage::ExtendDiscovery => DiscoveryMessageType::ExtendDiscovery,
+            DiscoveryMessage::Discovery => DiscoveryMessageKind::Discovery,
+            DiscoveryMessage::Announce { .. } => DiscoveryMessageKind::Announce,
+            DiscoveryMessage::ExtendAnnouncements => DiscoveryMessageKind::ExtendAnnouncements,
         }
     }
     fn try_parse(msg: &[u8]) -> Option<Self> {
-        if msg.starts_with(DiscoveryMessageType::Discovery.header())
-            && msg.len() == DiscoveryMessageType::Discovery.header().len() + 32
+        if msg.starts_with(DiscoveryMessageKind::Discovery.header())
+            && msg.len() == DiscoveryMessageKind::Discovery.header().len() + 32
             && msg.ends_with(sha2::Sha256::digest(&msg[..msg.len() - 32]).as_ref()) {
             Some(DiscoveryMessage::Discovery)
-        } else if msg.starts_with(DiscoveryMessageType::Announce.header())
-            && msg.len() == DiscoveryMessageType::Announce.header().len() + 2 + 4 + 32 + 1 {
-            let msg_body = &msg[DiscoveryMessageType::Announce.header().len()..];
+        } else if msg.starts_with(DiscoveryMessageKind::Announce.header())
+            && msg.len() == DiscoveryMessageKind::Announce.header().len() + 2 + 4 + 32 + 1 {
+            let msg_body = &msg[DiscoveryMessageKind::Announce.header().len()..];
             let local_port = u16::from_be_bytes(msg_body[0..2].try_into().unwrap());
             let discover_id = u32::from_be_bytes(msg_body[2..6].try_into().unwrap());
             let disconnected = msg_body[6] != 0;
@@ -292,10 +341,10 @@ impl DiscoveryMessage {
             } else {
                 None
             }
-        } else if msg.starts_with(DiscoveryMessageType::ExtendDiscovery.header())
-            && msg.len() == DiscoveryMessageType::ExtendDiscovery.header().len() + 32
+        } else if msg.starts_with(DiscoveryMessageKind::ExtendAnnouncements.header())
+            && msg.len() == DiscoveryMessageKind::ExtendAnnouncements.header().len() + 32
             && msg.ends_with(sha2::Sha256::digest(&msg[..msg.len() - 32]).as_ref()) {
-            Some(DiscoveryMessage::ExtendDiscovery)
+            Some(DiscoveryMessage::ExtendAnnouncements)
         } else {
             None
         }
@@ -311,7 +360,7 @@ impl DiscoveryMessage {
                 hello_msg.push(*disconnected as u8);
                 hello_msg
             }
-            DiscoveryMessage::ExtendDiscovery => header.to_vec(),
+            DiscoveryMessage::ExtendAnnouncements => header.to_vec(),
         };
 
         let sha = sha2::Sha256::digest(&message);

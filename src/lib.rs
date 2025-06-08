@@ -39,7 +39,7 @@ impl Reprise {
         let (discover_tx, mut discover_rx) = watch::channel(0);
         // handle multicast discovery in a separate thread
         let jh = thread::Builder::new().name("[Reprise accept]".to_string()).spawn(move || {
-            info!("Multicast discovery running! discover_id: {:x}", multicast_socket.discover_id());
+            info!("Multicast discovery running! discover_id: {:x}, port: {:?}", multicast_socket.discover_id(), multicast_socket.running_port());
             loop {
                 if discover_rx.has_changed().unwrap() {
                     discover_rx.mark_unchanged();

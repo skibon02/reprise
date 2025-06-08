@@ -91,16 +91,37 @@ impl MulticastDiscoverySocket {
 
         bail!("Failed to create multicast socket on any of the configured ports: {:?}", cfg);
     }
+    
+    pub fn discover_id(&self) -> u32 {
+        self.discover_id
+    }
 
     /// Setting this to `false` will disable both announcements and handling discovery packets
     pub fn set_announce_en(&mut self, en: bool) {
         self.announce_enabled = en;
     }
 
+
+    /// Manually discover all clients on main or backup ports
+    pub fn discover(&mut self) {
+        info!("Multicast discovery: running manual discovery...");
+        let msg = DiscoveryMessage::Discovery.gen_message();
+        for interface in all_interfaces() {
+            let ports = once(self.cfg.multicast_port);
+            let ports = ports.chain(self.cfg.multicast_backup_ports.iter().copied());
+            for port in ports {
+                if let Err(e) = self.socket.send_to_port(&msg, &Interface::Ip(interface), port) {
+                    warn!("Failed to send discovery message on interface {}: {}", interface, e);
+                } else {
+                    trace!("Sent discovery message to port {} on interface {}", port, interface);
+                }
+            }
+        }
+    }
     pub fn poll(&mut self) -> PollResult {
         self.try_poll().unwrap_or(PollResult::Nothing)
     }
-    pub fn try_send_announce_packet(&mut self, disconnected: bool) {
+    fn try_send_announce_packet(&mut self, disconnected: bool) {
         if self.announce_enabled {
             let is_extended_announcement = self.extend_disc_request_tm.is_some_and(|tm| tm.elapsed() < EXTENDED_ANNOUNCE_EFFECT_DUR);
             if self.send_discovery_tm.is_none_or(|tm| Instant::now() > tm + BG_ANNOUNCE_INTERVAL) {
@@ -260,18 +281,21 @@ impl DiscoveryMessage {
             && msg.ends_with(sha2::Sha256::digest(&msg[..msg.len() - 32]).as_ref()) {
             Some(DiscoveryMessage::Discovery)
         } else if msg.starts_with(DiscoveryMessageType::Announce.header())
-            && msg.len() == DiscoveryMessageType::Announce.header().len() + 2 + 4 + 32 {
-            let local_port = u16::from_be_bytes([msg[msg.len() - 38], msg[msg.len() - 37]]);
-            let discover_id = u32::from_be_bytes([
-                msg[msg.len() - 36], msg[msg.len() - 35],
-                msg[msg.len() - 34], msg[msg.len() - 33]
-            ]);
+            && msg.len() == DiscoveryMessageType::Announce.header().len() + 2 + 4 + 32 + 1 {
+            let msg_body = &msg[DiscoveryMessageType::Announce.header().len()..];
+            let local_port = u16::from_be_bytes(msg_body[0..2].try_into().unwrap());
+            let discover_id = u32::from_be_bytes(msg_body[2..6].try_into().unwrap());
+            let disconnected = msg_body[6] != 0;
             let sha = sha2::Sha256::digest(&msg[..msg.len() - 32]);
             if msg.ends_with(&sha[..32]) {
-                Some(DiscoveryMessage::Announce { local_port, discover_id, disconnected: false })
+                Some(DiscoveryMessage::Announce { local_port, discover_id, disconnected })
             } else {
                 None
             }
+        } else if msg.starts_with(DiscoveryMessageType::ExtendDiscovery.header())
+            && msg.len() == DiscoveryMessageType::ExtendDiscovery.header().len() + 32
+            && msg.ends_with(sha2::Sha256::digest(&msg[..msg.len() - 32]).as_ref()) {
+            Some(DiscoveryMessage::ExtendDiscovery)
         } else {
             None
         }

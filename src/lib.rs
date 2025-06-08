@@ -8,11 +8,14 @@ use std::thread::yield_now;
 use std::time::Duration;
 use log::info;
 use quinn::Endpoint;
+use tokio::sync::watch;
+use tokio::sync::watch::Sender;
 use crate::config::MulticastDiscoveryConfig;
 use crate::multicast::{MulticastDiscoverySocket, PollResult};
 
 pub struct Reprise {
     endpoint: Endpoint,
+    discover_signal: Sender<u32>,
 }
 
 impl Reprise {
@@ -33,9 +36,15 @@ impl Reprise {
         
         // multicast init
         let mut multicast_socket = MulticastDiscoverySocket::new(&cfg, socket_port)?;
+        let (discover_tx, mut discover_rx) = watch::channel(0);
         // handle multicast discovery in a separate thread
         let jh = thread::Builder::new().name("[Reprise accept]".to_string()).spawn(move || {
+            info!("Multicast discovery running! discover_id: {:x}", multicast_socket.discover_id());
             loop {
+                if discover_rx.has_changed().unwrap() {
+                    discover_rx.mark_unchanged();
+                    multicast_socket.discover()
+                }
                 match multicast_socket.poll() { 
                     PollResult::Nothing => {
                         thread::sleep(Duration::from_millis(10));
@@ -63,13 +72,16 @@ impl Reprise {
             while let Some(conn) = endpoint_connection.accept().await {
                 info!("New connection from {}", conn.remote_address());
                 conn.refuse();
-                
             }
         });
 
-
         Ok(Reprise {
-            endpoint
+            endpoint,
+            discover_signal: discover_tx,
         })
+    }
+    
+    pub fn discover(&self) {
+        self.discover_signal.send_modify(|v| *v = v.wrapping_add(1))
     }
 }

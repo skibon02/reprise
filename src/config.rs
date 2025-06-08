@@ -17,13 +17,13 @@ pub struct MulticastDiscoveryConfig {
 impl MulticastDiscoveryConfig {
     pub fn new(
         multicast_group_ip: std::net::Ipv4Addr,
-        service_name: &'static str,
+        service_name: Cow<'static, str>
     ) -> Self {
         Self {
             multicast_group_ip,
             multicast_port: 37337,
             multicast_backup_ports: (61345..61347).collect(),
-            service_name: Cow::Borrowed(service_name),
+            service_name,
             central_discovery_addr: None,
             enable_announce: true,
         }

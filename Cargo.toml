@@ -4,8 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-quinn = "0.11.8"
-rustls = "0.23.27"
+quinn = { version = "0.11.8", features = ["rustls-ring"] }
 tokio = { version = "1.45.1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1.0.98"
 rcgen = "0.13.2"

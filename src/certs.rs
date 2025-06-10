@@ -1,3 +1,4 @@
+use quinn::rustls;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
 pub fn generate_self_signed_cert()
